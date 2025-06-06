@@ -1,0 +1,443 @@
+#!/bin/bash
+
+# xpliha02 - Petr Plíhal
+# 17.3.2024
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C # Není třeba
+
+# Kontrola/nastavení proměnné XTF_PROFIT - použita pro výpočet fiktivního zisku
+# Proměnná XTF_PROFIT nesmí být prázdná
+if [ -z "$XTF_PROFIT" ]; then
+    # Zpřístupnění pro volané skripty/podprocesy
+    export XTF_PROFIT=20
+else
+    # XTF_PROFIT musí být číslo
+    if ! echo "$XTF_PROFIT" | grep -qE '^[-+]?[0-9]+$'; then
+        echo "$0: Chyba: XTF_PROFIT musí být číslo, ne: $XTF_PROFIT" >&2
+        exit 1
+    fi
+
+    # XTF_PROFIT musí být kladné číslo
+    if [ "$XTF_PROFIT" -lt 0 ]; then
+        echo "$0: Chyba: XTF_PROFIT musí být kladné číslo, ne: $XTF_PROFIT" >&2
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------------------------------------------------------------- #
+#                                                   Zpracování argumentů                                              #
+# ------------------------------------------------------------------------------------------------------------------- #
+
+# Inicializace proměnných pro (případné) použití
+datum_po=""
+datum_pred=""
+meny=""
+prikaz=""
+uzivatel=""
+log_soubory=""
+
+# Po načtení uživatele musí následovat pouze log soubory, jakékoli jiné argumenty jsou chyba
+log_sekvence=0
+zkontroluj_argumety_pred_logy() {
+    if [ $log_sekvence -eq 1 ]; then
+        echo "$0: Chyba: seznam log souborů musí být posledním argumentem, argument $1 nalezen za seznamem logů $log_soubory" >&2
+        exit 1
+    fi
+}
+
+# Přepínače -a, -b a příkazy mohou být použity pouze jednou
+zkontroluj_duplicitu_argumentu() {
+    hodnota_promenne_argumentu="$1"
+    nazev_argumentu="$2"
+
+    if [ -n "$1" ]; then
+        echo "$0: Chyba: přepínač/příkaz $nazev_argumentu již má přiřazenu hodnotu $hodnota_promenne_argumentu, může být použit pouze jednou" >&2
+        exit 1
+    fi
+}
+
+# Zpracování přepínačů a argumentů
+while [ $# -gt 0 ]; do
+
+    #argument="$ # TODO: přejmenovat NĚKTERÉ $1 na $argument, po shiftu, je třeba použít vždy opět $1 (první "další" argument)
+    case "$1" in
+        -h|--help) # Přepínač -h nebere žádný další argument
+            echo "Použití: xtf [-h|--help] [FILTR] [PŘÍKAZ] UŽIVATEL LOG [LOG2 [...]"
+            exit 0
+            ;;
+
+        -a)
+            zkontroluj_duplicitu_argumentu "$datum_po" "$1"
+
+            shift
+            datum_po="$1"
+
+            zkontroluj_argumety_pred_logy "$1"
+            ;;
+
+        -b)
+            zkontroluj_duplicitu_argumentu "$datum_pred" "$1"
+
+            shift
+            datum_pred="$1"
+
+            zkontroluj_argumety_pred_logy "$1"
+            ;;
+
+        -c) # Přepínač -c se může použít vícekrát
+            shift
+            if [ -z "$meny" ]; then
+                meny="$1"
+            else
+                meny="$meny $1"
+            fi
+
+            zkontroluj_argumety_pred_logy "$1"
+            ;;
+
+        list|list-currency|status|profit)
+            zkontroluj_duplicitu_argumentu "$prikaz" "$1"
+
+            prikaz="$1"
+
+            zkontroluj_argumety_pred_logy "$1"
+            ;;
+
+        *) # Ostatní argumenty jsou uživatelé a log soubory
+
+           # Dle zadání jsou log soubory vždy poslední -> uživatel je první argument, který není přepínač ani příkaz 
+            if [ -z "$uzivatel" ]; then
+                uzivatel="$1"
+            else
+
+                if [ -z "$log_soubory" ]; then
+                    log_soubory="$1"
+                else
+                    # Soubory mohou obsahovat i mezery -> oddělení středníkem
+                    log_soubory="$log_soubory;$1"
+                fi
+
+                log_sekvence=1
+            fi
+            ;;
+    esac
+    shift
+done
+
+# Každé spuštění musí mít uživatele a alespoň jeden log soubor
+if [ -z "$uzivatel" ] || [ -z "$log_soubory" ]; then
+    echo "$0: Chyba: musí být zadán uživatel a alespoň jeden log soubor" >&2
+    exit 1
+fi
+
+# Spuštění skriptu bez příkazu je korektní, příkaz list je výchozí
+if [ -z "$prikaz" ]; then
+    prikaz="list"
+fi
+
+# ------------------------------------------------------------------------------------------------------------------- #
+#                                                   Funkce skriptu                                                    #
+# ------------------------------------------------------------------------------------------------------------------- #
+
+# Datumy přepínačů -a -b musí být validní datumy
+zkontroluj_datum() {
+    vstupni_datum="$1"
+    if [ -n "$vstupni_datum" ] && ! date -d "$vstupni_datum" >/dev/null 2>&1; then
+        echo "$0: Chyba: neexistující datum: $vstupni_datum" >&2
+        exit 1
+    fi
+}
+
+# Měny přepínače -c musí být ve formátu tří velkých písmen
+zkontroluj_meny() {
+
+    vstupni_pole_men="$1"
+
+    # Prázdné pole měn je validní - -c není povinný přepínač
+    if [ -n "$vstupni_pole_men" ]; then
+
+        for currency in $vstupni_pole_men; do
+
+            # Měna musí být tři (velká) písmena
+            if ! echo "$currency" | grep -qE '^[A-Z]{3}$'; then
+                echo "$0: Chyba: neplatná měna: $currency" >&2
+                exit 1
+            fi
+
+        done
+
+    fi
+}
+
+
+# Načte a zkontoluje běžné i zipované vstupní log soubory
+nacti_logy() {
+
+    # Odložení původního IFS (Internal Field Separator - výchozí oddělovač polí)
+    # Názvy souborů mohou obsahovat mezery -> oddělení soborů středníkem
+    puvodni_ifs="$IFS"
+    IFS=";"
+
+    for log_soubor in $log_soubory; do
+        # -f -> existence ; -r -> čitelnost (i zipované soubory musí být čitelné)
+        if [ ! -f "$log_soubor" ] || [ ! -r "$log_soubor" ]; then
+
+            # V případě chyby obnoví původní IFS (není vyloženě třeba - je lokální)
+            IFS="$puvodni_ifs"
+
+            echo "$0: Chyba: log soubor s názvem: $log_soubor neexistuje" >&2
+            exit 1
+        fi
+
+        # zcat pro čtení zipovaných souborů ; cat pro čtení běžných souborů
+        case "$log_soubor" in
+            *.gz)
+                zcat "$log_soubor"
+                ;;
+            *)
+                cat "$log_soubor"
+                ;;
+        esac
+    done
+
+    # Obnoví původní IFS (není vyloženě třeba - je lokální)
+    IFS="$puvodni_ifs"
+}
+
+# Základní kontroly vstupu:
+#   *) Prázdné řádky jsou ignorovány
+#   *) Žádná položka logu (po vyřazení prázdných řádků) nesmí být prázdná
+#   *) Kontrola FORMÁTU data
+zakldani_kontroly() {
+    awk -v uzivatel="$uzivatel" '
+    BEGIN { 
+        FS = ";"
+    }
+    {
+        # Prázdné řádky (nebo řádky s whitespace znaky) jsou ignorovány
+        if ($0 ~ /^ *$/) {
+            next
+        }
+
+        log_uzivatel = $1
+        log_datum = $2
+        log_mena = $3
+        log_hodnota_meny = $4
+
+        # Žádná položka nesmí být prázdná
+        if (log_uzivatel == "" || log_datum == "" || log_mena == "" || log_hodnota_meny == "") {
+            exit 1
+        }
+
+        # Zkontroluje FORMÁT data (ne hodnotu)
+        if (log_datum !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/) {
+            exit 2
+        }
+
+        print
+    }
+    '
+    case $? in
+        1)
+            echo "$0: Chyba: jedna z položek log souboru je prázdná" >&2
+            exit 1
+            ;;
+        2)
+            echo "$0: Chyba: neplatný formát data v log souboru" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Příkaz list - využíván každým dalším příkazem - filtruje vstupy dle uživatele
+list() {
+    awk -v uzivatel="$uzivatel" '
+    BEGIN { 
+        FS = ";"
+    }
+    {
+        log_uzivatel = $1
+
+        if (log_uzivatel == uzivatel) {
+            print
+        }
+    }
+    '
+}
+
+# Použití FILTRŮ na log záznamy
+filtry() {
+    awk -v uzivatel="$uzivatel" -v datum_po="$datum_po" -v datum_pred="$datum_pred" -v meny="$meny" '
+    BEGIN { 
+        FS = ";"
+
+        # Proměnné pro přepínání filtrů - vstup se filtruje vždy, ale přepínače -a -b -c nejsou povinné
+        datum_po_filtr = (datum_po != "")
+        datum_pred_filtr = (datum_pred != "")
+        mena_filtr = (meny != "")
+
+        # Pole měn
+        split(meny, pole_men, " ")
+
+    }
+    {
+
+        log_mena = $3
+        log_datum = $2
+
+        # Kontrola filtrů dat - pokud je přepínač nastaven a není splněna jeho kontrola -> log záznam se přeskočí
+        if (datum_po_filtr) {
+            if (! (datum_po < log_datum)) {
+                next
+            }
+        }     
+        if (datum_pred_filtr) {
+            if (! (log_datum < datum_pred)) {
+                next
+            }
+        }
+
+        # Kontrola filtru měn
+        if (mena_filtr) {
+            found = 0
+
+            # Měna log záznamu je (právě) jednou z hledaných -> není třeba procházet zbytek měn -> výpis
+            for (currency_index in pole_men) {
+                if (log_mena == pole_men[currency_index]) {
+                    found = 1
+                    break
+                }
+            }
+            # Měna log záznamu není žádnou z hledaných -> přeskočení záznamu
+            if (!found) {
+                next
+            }
+        }
+
+        # Log záznam je vypsán, pokud byl splněn (resp. nebyl zachycen) všemi filtry
+        print
+    }
+    '
+}
+
+# Příkaz list_currency - vypíše všechny měny (ne záznamy s danou měnou), které se v logu vyskytují, pak je seřadí
+list_currency() {
+    awk '
+    BEGIN { 
+        FS = ";"
+    }
+    {
+
+    log_mena = $3
+
+    # Pokud je měna nová, přidá se do pole
+    if (!(log_mena in nalezene_meny)) {
+        nalezene_meny[log_mena] = 1 # Index asociativního pole -> nemusí být int hodnota
+    }
+
+    }
+    END {
+        for (mena in nalezene_meny) {
+            print mena
+        }
+    }
+    ' | sort
+}
+
+# Příkaz status - vypíše seřazený skutečný stav účtu dle měn
+status() {
+    awk '
+    BEGIN { 
+        FS = ";"
+    }
+    {
+
+    log_mena = $3
+    log_hodnota_meny = $4
+
+    # Na vstup může přijít i prázný záznam, což je taky validní filtovaný vstup/výstup
+    if (log_mena != "" && log_hodnota_meny != "") {
+
+        # Pokud je měna nová, přidá se do pole
+        if (!(log_mena in meny)) {
+            meny[log_mena] = 1
+        }
+
+        # Přičtení nebo odečtení hodnoty z účtu
+        stav_uctu[log_mena] += log_hodnota_meny
+    }
+
+    }
+    END {
+        # Vytiskne stav účtu pro každou měnu
+        for (mena in meny) {
+            printf "%s : %.4f\n", mena, stav_uctu[mena]
+        }
+    }
+    ' | sort
+
+}
+
+# Příkaz profit - vypíše fiktivní stav účtu 
+profit() {
+    awk -v xtf_profit="$XTF_PROFIT" '
+    BEGIN { 
+        FS = ";"
+    }
+    {
+
+    log_mena = $3
+    log_hodnota_meny = $4
+
+    # Pokud je měna nová, přidá se do seznamu
+    if (!(log_mena in meny)) {
+        meny[log_mena] = 1
+    }
+
+    # Přičtení (nebo odečtení) hodnoty k účtu (bez fiktivního zisku - je přidán na konci)
+
+    stav_uctu[log_mena] += log_hodnota_meny
+
+    }
+    END {
+
+        # Přičte fiktivní zisk a vytiskne stav účtu pro každou měnu
+        for (mena in meny) {
+
+            if (stav_uctu[mena] > 0) {
+                navyseni_meny = stav_uctu[mena] * (xtf_profit / 100)
+                stav_uctu[mena] += navyseni_meny
+            }
+
+            printf "%s : %.4f\n", mena, stav_uctu[mena]
+        }
+    }
+    ' | sort
+}
+
+
+# ------------------------------------------------------------------------------------------------------------------- #
+#                                                 Hlavní část skriptu                                                 #
+# ------------------------------------------------------------------------------------------------------------------- #
+
+zkontroluj_datum "$datum_po"
+zkontroluj_datum "$datum_pred"
+zkontroluj_meny "$meny"
+
+# Provedení příkazu (kombinace funkcí), kde každý příkaz musí vrátit 0, jinak je výstup skriptu != 0
+set -o pipefail
+case "$prikaz" in
+    list)
+        nacti_logy | zakldani_kontroly | list | filtry
+        ;;
+    list-currency)
+        nacti_logy | zakldani_kontroly | list | filtry | list_currency
+        ;;
+    status)
+        nacti_logy | zakldani_kontroly | list | filtry | status
+        ;;
+    profit)
+        nacti_logy | zakldani_kontroly | list | filtry | profit
+        ;;
+esac
